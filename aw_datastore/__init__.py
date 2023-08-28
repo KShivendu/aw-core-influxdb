@@ -6,12 +6,13 @@ from .migration import check_for_migration
 
 
 def get_storage_methods() -> Dict[str, Callable[..., storages.AbstractStorage]]:
-    from .storages import MemoryStorage, PeeweeStorage, SqliteStorage
+    from .storages import MemoryStorage, PeeweeStorage, SqliteStorage, InfluxDBStorage
 
     methods: Dict[str, Callable[..., storages.AbstractStorage]] = {
         PeeweeStorage.sid: PeeweeStorage,
         MemoryStorage.sid: MemoryStorage,
         SqliteStorage.sid: SqliteStorage,
+        InfluxDBStorage.sid: InfluxDBStorage,
     }
     return methods
 

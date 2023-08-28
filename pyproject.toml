@@ -29,6 +29,7 @@ strict-rfc3339 = "^0.7"
 tomlkit = "*"
 deprecation = "*"
 timeslot = "*"
+influxdb = "^5.3.1"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0"
