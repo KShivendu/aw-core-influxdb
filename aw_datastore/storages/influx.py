@@ -51,6 +51,9 @@ from .abstract import AbstractStorage
 """
 
 
+VERSION = 1
+ACTIVITY = "activity"
+
 class InfluxDBStorage(AbstractStorage):
     """Uses a InfluxDB server as backend"""
 
@@ -88,7 +91,7 @@ class InfluxDBStorage(AbstractStorage):
 
     def _event_to_point(self, event: Event) -> Point:
         return (
-            Point("activity")
+            Point(ACTIVITY)
             .tag("app", event.client)
             .field("metadata", json.dumps(event.metadata))
         )
@@ -164,8 +167,8 @@ class InfluxDBStorage(AbstractStorage):
 
     def get_event(self, bucket_id: str, event_id: int) -> Optional[Event]:
         event = self.read_api.query(
-            'from(bucket: "{}") |> filter(fn: (r) => r._measurement == "events" and r.id == {})'.format(
-                bucket_id, event_id
+            'from(bucket: "{}") |> filter(fn: (r) => r._measurement == "{}" and r.id == {})'.format(
+                bucket_id, ACTIVITY, event_id
             )
         )[0]
         return Event(
@@ -198,7 +201,7 @@ class InfluxDBStorage(AbstractStorage):
         # else:
         #     query += ")"
 
-        query = f'from(bucket: "{bucket_id}") |> range(start: -1h) |> filter(fn: (r) => r["_measurement"] == "activity")'
+        query = f'from(bucket: "{bucket_id}") |> range(start: -1h) |> filter(fn: (r) => r["_measurement"] == "{ACTIVITY}")'
 
         # print("final query", query)
         # return [
@@ -209,22 +212,37 @@ class InfluxDBStorage(AbstractStorage):
         print("GET_EVENTS_CALLED")
 
         events = []
-        counter = 0
         for entry in entries:
             # Passing timestamp value to avoid warning. but it doesn't really add any value here!
-            event = Event(timestamp=datetime.now().replace(tzinfo=timezone.utc))
             for r in entry.records:
                 # print("Record", r)
-                if r["_field"] == "id":
-                    event.id = r["_value"]
-                    event.timestamp = r["_time"]
-                if r["_field"] == "duration":
-                    event.duration = r["_value"]
 
-                event.data[r["_field"]] = r["_value"]
+                if VERSION == 1:
+                    info = {}
+                    if r["_field"] == "info":
+                        info = json.loads(r["_value"])
+                        event = Event(
+                            id=info["id"],
+                            timestamp=r["_time"],
+                            duration=info["duration"],
+                            data=info["data"],
+                        )
+                        events.append(event)
+                    else:
+                        # print("Found other fields", r["_field"])
+                        pass
+                else:
+                    pass
+
+                # print("Record", r)
+                # if r["_field"] == "id":
+                #     event.id = r["_value"]
+                #     event.timestamp = r["_time"]
+                # if r["_field"] == "duration":
+                #     event.duration = r["_value"]
+
+                # event.data[r["_field"]] = r["_value"]
                 # print("Event from record", event)
-
-                events.append(event)
 
                 # try: data = json.loads(r["_value"])
                 # except: data = r["_value"]
@@ -245,8 +263,6 @@ class InfluxDBStorage(AbstractStorage):
                 #         data=data.get("data", {}),
                 #     )
                 # )
-
-                counter += 1
 
         return events
 
@@ -287,7 +303,44 @@ class InfluxDBStorage(AbstractStorage):
             pass
         else:
             # This probably comes only from self.replace_event
-            print("FOUND_EVENT_WITH_ID", event.id)
+            # print("FOUND_EVENT_WITH_ID", event.id)
+            pass
+
+        if VERSION == 1:
+            event_id = event.id or int(event.timestamp.timestamp())
+            point = Point("activity").time(event.timestamp, self.time_precision).field("info", json.dumps({
+                "id": event_id,
+                "timestamp": event.timestamp.isoformat(),
+                "duration": event.duration.total_seconds(),
+                "data": event.data
+            }))
+            # Note: Adding anything as a field creates multiple entries for each point.
+            # Don't add "timestamp" tag because it instantly bloats number of series in grafana graphs
+            # will have to do too many adjustments to fix that!
+            # .tag("timestamp", event_id) # .tag("id", event_id) # .field("event_id", event_id)
+            # Note: Looks like "id" isn't allowed as a tag. It doesn't appear in the results
+
+            for tag in ["app", "status"]:
+                if tag in event.data:
+                    point = point.tag(tag, event.data[tag])
+
+            self.write_api.write(bucket=bucket_id, record=point)
+        else:
+            # This complicates the results a lot. I get multiple tables which is super hard to handle
+            point = Point("activity").time(event.timestamp, WritePrecision.MS) # .field("id", event.id)
+            point = point.field("duration", event.duration.total_seconds())
+
+            for key, value in event.data.items():
+                if key in ("status", "app"):
+                    point = point.tag(key, value)
+
+                point = point.field(key, value)
+
+            point = point.field("id", int(event.timestamp.timestamp())) #
+
+            self.write_api.write(bucket=bucket_id, record=point)
+            return event
+
 
         # event_copy = copy.deepcopy(event)
         # timestamp_value = event.timestamp.isoformat()
@@ -316,20 +369,6 @@ class InfluxDBStorage(AbstractStorage):
         #     .field("duration", duration_value)
         #     .time(event.timestamp, WritePrecision.MS)
         # )
-
-        point = Point("activity").time(event.timestamp, WritePrecision.MS).field("id", event.id)
-        point = point.field("duration", event.duration.total_seconds())
-
-        for key, value in event.data.items():
-            if key in ("status", "app"):
-                point = point.tag(key, value)
-
-            point = point.field(key, value)
-
-        point = point.field("id", int(event.timestamp.timestamp())) #
-
-        self.write_api.write(bucket=bucket_id, record=point)
-        return event
 
     def insert_many(self, bucket_id: str, events: List[Event]) -> None:
         print("Trying to insert with _INSERT_BULK_")
@@ -361,37 +400,53 @@ class InfluxDBStorage(AbstractStorage):
             query = f'from(bucket: "{bucket_id}") |> range(start: 0) |> last()'
             # res = self.read_api.query(query)[0].records[0]
 
-            res = self.read_api.query(query)
-
             entries = self.read_api.query(query)
 
-            timestamp = 0
-            duration = 0
-            data = {}
+            # timestamp = 0
+            # duration = 0
+            # data = {}
 
             for e in entries:
                 for r in e.records:
-                    print(r)
-                    if r["_field"] == "_time":
-                        timestamp = r["_value"]
-                    if r["_field"] == "duration":
-                        duration = r["_value"]
-                    if r["_field"] == "data":
-                        data = r["_value"]
 
-                    try: data = json.loads(data)
-                    except: pass
+                    if VERSION == 1:
+                        info = {}
+                        if r["_field"] == "info":
+                            info = json.loads(r["_value"])
+                            event = Event(
+                                id=info["id"],
+                                timestamp=r["_time"],
+                                duration=info["duration"],
+                                data=info["data"],
+                            )
+                            return event
+                        else:
+                            pass
+                            # print("Found other fields", r["_field"])
+                    else:
+                        pass
 
-            event = Event(
-                id=timestamp, # r.id, # FIXME: counter isn't reliable at all. it's on per API call basis.
-                # it will get reset easily.
-                timestamp=datetime.fromtimestamp(timestamp).replace(tzinfo=timezone.utc),
-                  # r.timestamp,
-                duration=duration, # r.duration,
-                data=data.get("data", {}),
-            )
+                    # print(r)
+                    # if r["_field"] == "_time":
+                    #     timestamp = r["_value"]
+                    # if r["_field"] == "duration":
+                    #     duration = r["_value"]
+                    # if r["_field"] == "data":
+                    #     data = r["_value"]
 
-            return event
+                    # try: data = json.loads(data)
+                    # except: pass
+
+            # event = Event(
+            #     id=timestamp, # r.id, # FIXME: counter isn't reliable at all. it's on per API call basis.
+            #     # it will get reset easily.
+            #     timestamp=datetime.fromtimestamp(timestamp).replace(tzinfo=timezone.utc),
+            #       # r.timestamp,
+            #     duration=duration, # r.duration,
+            #     data=data.get("data", {}),
+            # )
+
+            # return event
 
                     # duration = data.get("duration", 0)
 
@@ -413,6 +468,6 @@ class InfluxDBStorage(AbstractStorage):
 
         last_event = _get_last_event(bucket_id)
         # print("Last event", last_event)
-        last_event.id = int(event.timestamp.timestamp()) # int will truncate decimals. Is it a good idea??
+        last_event.id = event.id or int(event.timestamp.timestamp()) # int will truncate decimals. Is it a good idea??
         # print("Last event after change", last_event)
         self.insert_one(bucket_id, last_event)
